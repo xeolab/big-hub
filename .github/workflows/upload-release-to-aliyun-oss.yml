@@ -1,0 +1,275 @@
+name: Upload release ZIP to Aliyun OSS
+
+on:
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      release_tag:
+        description: GitHub Release tag to upload
+        required: true
+        type: string
+    secrets:
+      OSS_ACCESS_KEY_ID:
+        required: true
+      OSS_ACCESS_KEY_SECRET:
+        required: true
+      FEISHU_WEBHOOK_URL:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aliyun-oss-release-${{ inputs.release_tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  # 除 AccessKey 外，其余 OSS 配置都在这里修改。
+  OSS_BUCKET: xeo-bj
+  OSS_PREFIX: xeo-big/big-hub/releases
+  OSS_REGION: cn-beijing
+  OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+  OSS_BASE_URL: https://cdn.xeo.com.cn
+
+  # 固定 ossutil 版本和校验值，避免下载内容在不知情时发生变化。
+  OSSUTIL_VERSION: "2.3.0"
+  OSSUTIL_ARCHIVE: ossutil-2.3.0-linux-amd64.zip
+  OSSUTIL_SHA256: 3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a
+
+jobs:
+  upload-release:
+    name: Package and upload release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # 在仓库 Settings > Secrets and variables > Actions 中创建这些 Secret。
+      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+      FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+
+    steps:
+      - name: Check out the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.event.release.tag_name }}
+
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : "${OSS_ACCESS_KEY_ID:?Missing GitHub Secret: OSS_ACCESS_KEY_ID}"
+          : "${OSS_ACCESS_KEY_SECRET:?Missing GitHub Secret: OSS_ACCESS_KEY_SECRET}"
+          : "${FEISHU_WEBHOOK_URL:?Missing GitHub Secret: FEISHU_WEBHOOK_URL}"
+          : "${OSS_REGION:?OSS_REGION must be configured}"
+          : "${OSS_ENDPOINT:?OSS_ENDPOINT must be configured}"
+          : "${OSS_BASE_URL:?OSS_BASE_URL must be configured}"
+
+          if [[ -z "${OSS_BUCKET}" || "${OSS_BUCKET}" == "your-bucket-name" ]]; then
+            echo "Please set OSS_BUCKET in this workflow." >&2
+            exit 1
+          fi
+
+      - name: Download release assets and create ZIP
+        id: package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          safe_tag="$(printf '%s' "${RELEASE_TAG}" | tr -c 'A-Za-z0-9._-' '-')"
+          archive_name="${repository_name}-${safe_tag}.zip"
+          archive_path="${RUNNER_TEMP}/${archive_name}"
+          asset_count="$(gh release view "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json assets \
+            --jq '.assets | length')"
+
+          if (( asset_count > 0 )); then
+            mkdir -p release-assets
+            gh release download "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --dir release-assets
+            (
+              cd release-assets
+              zip -q -r "${archive_path}" .
+            )
+          else
+            # GitHub Release 没有附件时，打包该标签对应的仓库源码。
+            git archive \
+              --format=zip \
+              --prefix="${repository_name}-${safe_tag}/" \
+              --output="${archive_path}" \
+              "${RELEASE_TAG}"
+          fi
+
+          sha256sum "${archive_path}"
+          release_json="$(gh release view "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json url,publishedAt)"
+
+          echo "archive_name=${archive_name}" >> "${GITHUB_OUTPUT}"
+          echo "archive_path=${archive_path}" >> "${GITHUB_OUTPUT}"
+          echo "release_url=$(jq -r '.url' <<< "${release_json}")" >> "${GITHUB_OUTPUT}"
+          echo "published_at=$(jq -r '.publishedAt' <<< "${release_json}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Install ossutil
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "${RUNNER_TEMP}"
+          curl --fail --silent --show-error --location \
+            --output "${OSSUTIL_ARCHIVE}" \
+            "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ARCHIVE}"
+          echo "${OSSUTIL_SHA256}  ${OSSUTIL_ARCHIVE}" | sha256sum --check --strict
+          unzip -q "${OSSUTIL_ARCHIVE}"
+          install -m 0755 \
+            "ossutil-${OSSUTIL_VERSION}-linux-amd64/ossutil" \
+            "${RUNNER_TEMP}/ossutil"
+          "${RUNNER_TEMP}/ossutil" version
+
+      - name: Upload ZIP to Aliyun OSS
+        id: upload
+        env:
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          normalized_prefix="${OSS_PREFIX#/}"
+          normalized_prefix="${normalized_prefix%/}"
+          if [[ -n "${normalized_prefix}" ]]; then
+            object_path="${normalized_prefix}/${RELEASE_TAG}/${ARCHIVE_NAME}"
+          else
+            object_path="${RELEASE_TAG}/${ARCHIVE_NAME}"
+          fi
+          destination="oss://${OSS_BUCKET}/${object_path}"
+          public_url="${OSS_BASE_URL%/}/${object_path}"
+
+          "${RUNNER_TEMP}/ossutil" cp --force "${ARCHIVE_PATH}" "${destination}"
+
+          echo "destination=${destination}" >> "${GITHUB_OUTPUT}"
+          echo "public_url=${public_url}" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Aliyun OSS upload complete"
+            echo
+            echo "- Release: \`${RELEASE_TAG}\`"
+            echo "- Object: \`${destination}\`"
+            echo "- CDN URL: ${public_url}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Send Feishu release card
+        env:
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          PUBLIC_URL: ${{ steps.upload.outputs.public_url }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+          RELEASE_URL: ${{ steps.package.outputs.release_url }}
+          PUBLISHED_AT: ${{ steps.package.outputs.published_at }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          payload_file="${RUNNER_TEMP}/feishu-release-card.json"
+          response_file="${RUNNER_TEMP}/feishu-response.json"
+
+          jq -n \
+            --arg tag "${RELEASE_TAG}" \
+            --arg archive "${ARCHIVE_NAME}" \
+            --arg download_url "${PUBLIC_URL}" \
+            --arg release_url "${RELEASE_URL}" \
+            --arg published_at "${PUBLISHED_AT}" \
+            --arg repository "${REPOSITORY_NAME}" \
+            '{
+              msg_type: "interactive",
+              card: {
+                config: {
+                  wide_screen_mode: true
+                },
+                header: {
+                  template: "green",
+                  title: {
+                    tag: "plain_text",
+                    content: ("🚀 " + $repository + " 发布成功")
+                  }
+                },
+                elements: [
+                  {
+                    tag: "markdown",
+                    content: (
+                      "**版本**：`" + $tag + "`\n" +
+                      "**文件**：`" + $archive + "`\n" +
+                      "**发布时间**：" + $published_at + "\n" +
+                      "**下载地址**：[" + $download_url + "](" + $download_url + ")"
+                    )
+                  },
+                  {
+                    tag: "hr"
+                  },
+                  {
+                    tag: "note",
+                    elements: [
+                      {
+                        tag: "plain_text",
+                        content: "文件已上传至阿里云 OSS，可以通过 CDN 下载。"
+                      }
+                    ]
+                  },
+                  {
+                    tag: "action",
+                    actions: [
+                      {
+                        tag: "button",
+                        type: "primary",
+                        text: {
+                          tag: "plain_text",
+                          content: "下载 Release ZIP"
+                        },
+                        url: $download_url
+                      },
+                      {
+                        tag: "button",
+                        type: "default",
+                        text: {
+                          tag: "plain_text",
+                          content: "查看 GitHub Release"
+                        },
+                        url: $release_url
+                      }
+                    ]
+                  }
+                ]
+              }
+            }' > "${payload_file}"
+
+          http_status="$(curl --silent --show-error --location \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data-binary "@${payload_file}" \
+            --output "${response_file}" \
+            --write-out '%{http_code}' \
+            "${FEISHU_WEBHOOK_URL}")"
+
+          if [[ "${http_status}" != "200" ]]; then
+            echo "Feishu WebHook returned HTTP ${http_status}." >&2
+            cat "${response_file}" >&2
+            exit 1
+          fi
+
+          response_code="$(jq -r '.code // .StatusCode // 0' "${response_file}")"
+          if [[ "${response_code}" != "0" ]]; then
+            response_message="$(jq -r '.msg // .StatusMessage // "Unknown error"' "${response_file}")"
+            echo "Feishu WebHook failed: ${response_message} (code ${response_code})." >&2
+            exit 1
+          fi
+
+          echo "Feishu release notification sent successfully."
