@@ -1,4 +1,6 @@
-name: Upload release ZIP to Aliyun OSS
+# 由 release/render_workflows.py 从 release/workflow.template.yml 生成——别手改这个文件。
+# 改模板或 repos.json 后重新渲染：python3 release/render_workflows.py
+name: Upload release assets to Aliyun OSS
 
 on:
   release:
@@ -14,8 +16,6 @@ on:
         required: true
       OSS_ACCESS_KEY_SECRET:
         required: true
-      FEISHU_WEBHOOK_URL:
-        required: false
       FEISHU_APP_ID:
         required: false
       FEISHU_APP_SECRET:
@@ -43,7 +43,7 @@ env:
 
 jobs:
   upload-release:
-    name: Package and upload release
+    name: Upload release files
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -54,11 +54,12 @@ jobs:
 
       # 飞书自建应用。应用没有 webhook——它直接调 OpenAPI 发消息，
       # 所以这里要的是 app 凭证，不是 webhook URL。
+      # 应用后台轮换过 App Secret 后，这个 Secret 是每个仓库各自一份，
+      # 用 feishu-automation 仓库的 tools/sync-github-secrets.sh 一次同步全部。
       FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
       FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
-      # 卡片发到哪个群（oc_ 开头）。不配则退回 FEISHU_WEBHOOK_URL。
+      # 卡片发到哪些群：一个或多个 chat_id（oc_ 开头），逗号分隔。仓库级 Variable 覆盖组织级。
       FEISHU_CHAT_ID: ${{ vars.FEISHU_CHAT_ID }}
-      FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       # 发版记录表（多维表格）。不配则只发卡片、不写表。
       FEISHU_BASE_APP_TOKEN: ${{ vars.FEISHU_BASE_APP_TOKEN }}
       FEISHU_BASE_TABLE_ID: ${{ vars.FEISHU_BASE_TABLE_ID }}
@@ -77,7 +78,9 @@ jobs:
           # Release 正文为空时，靠提交记录自动整理 changelog
           fetch-depth: 0
 
-      - name: Validate configuration
+      # 只校验上传制品必须有的东西。**飞书的配置故意不在这里查**——
+      # 通知配错了不该让制品发不出去。那几项挪到上传之后、发卡片之前。
+      - name: Validate OSS configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -93,20 +96,7 @@ jobs:
             exit 1
           fi
 
-          : "${FEISHU_APP_ID:?Missing GitHub Secret: FEISHU_APP_ID}"
-          : "${FEISHU_APP_SECRET:?Missing GitHub Secret: FEISHU_APP_SECRET}"
-
-          if [[ -z "${FEISHU_CHAT_ID}" && -z "${FEISHU_WEBHOOK_URL}" ]]; then
-            echo "需要 FEISHU_CHAT_ID（推荐）或 FEISHU_WEBHOOK_URL 之一，否则卡片没处发。" >&2
-            exit 1
-          fi
-
-          if [[ ! -f .github/scripts/feishu_release.py ]]; then
-            echo "缺少 .github/scripts/feishu_release.py，从 xeo-pm 复制过来。" >&2
-            exit 1
-          fi
-
-      - name: Download release assets and create ZIP
+      - name: Collect release files
         id: package
         env:
           GH_TOKEN: ${{ github.token }}
@@ -117,40 +107,38 @@ jobs:
 
           repository_name="${GITHUB_REPOSITORY#*/}"
           safe_tag="$(printf '%s' "${RELEASE_TAG}" | tr -c 'A-Za-z0-9._-' '-')"
-          archive_name="${repository_name}-${safe_tag}.zip"
-          archive_path="${RUNNER_TEMP}/${archive_name}"
+          files_dir="${RUNNER_TEMP}/release-files"
+          mkdir -p "${files_dir}"
           asset_count="$(gh release view "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
             --json assets \
             --jq '.assets | length')"
 
           if (( asset_count > 0 )); then
-            mkdir -p release-assets
+            # Release 里传了什么就上传什么：APK 就是 APK，zip 就是 zip，不再统一打成一个包。
+            # --clobber：重跑 workflow 时目录已存在，不加会直接失败。
             gh release download "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
-              --dir release-assets
-            (
-              cd release-assets
-              zip -q -r "${archive_path}" .
-            )
+              --dir "${files_dir}" \
+              --clobber
           else
             # GitHub Release 没有附件时，打包该标签对应的仓库源码。
             git archive \
               --format=zip \
               --prefix="${repository_name}-${safe_tag}/" \
-              --output="${archive_path}" \
+              --output="${files_dir}/${repository_name}-${safe_tag}.zip" \
               "${RELEASE_TAG}"
           fi
 
-          sha256sum "${archive_path}"
-          release_json="$(gh release view "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --json url,publishedAt)"
+          file_count="$(find "${files_dir}" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if (( file_count == 0 )); then
+            echo "没有任何可上传的文件" >&2
+            exit 1
+          fi
+          find "${files_dir}" -maxdepth 1 -type f -exec sha256sum {} +
 
-          echo "archive_name=${archive_name}" >> "${GITHUB_OUTPUT}"
-          echo "archive_path=${archive_path}" >> "${GITHUB_OUTPUT}"
-          echo "release_url=$(jq -r '.url' <<< "${release_json}")" >> "${GITHUB_OUTPUT}"
-          echo "published_at=$(jq -r '.publishedAt' <<< "${release_json}")" >> "${GITHUB_OUTPUT}"
+          echo "files_dir=${files_dir}" >> "${GITHUB_OUTPUT}"
+          echo "file_count=${file_count}" >> "${GITHUB_OUTPUT}"
 
       - name: Install ossutil
         shell: bash
@@ -168,11 +156,10 @@ jobs:
             "${RUNNER_TEMP}/ossutil"
           "${RUNNER_TEMP}/ossutil" version
 
-      - name: Upload ZIP to Aliyun OSS
+      - name: Upload release files to Aliyun OSS
         id: upload
         env:
-          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
-          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
+          FILES_DIR: ${{ steps.package.outputs.files_dir }}
           RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         shell: bash
         run: |
@@ -181,35 +168,69 @@ jobs:
           normalized_prefix="${OSS_PREFIX#/}"
           normalized_prefix="${normalized_prefix%/}"
           if [[ -n "${normalized_prefix}" ]]; then
-            object_path="${normalized_prefix}/${RELEASE_TAG}/${ARCHIVE_NAME}"
+            object_dir="${normalized_prefix}/${RELEASE_TAG}"
           else
-            object_path="${RELEASE_TAG}/${ARCHIVE_NAME}"
+            object_dir="${RELEASE_TAG}"
           fi
-          destination="oss://${OSS_BUCKET}/${object_path}"
-          public_url="${OSS_BASE_URL%/}/${object_path}"
 
-          "${RUNNER_TEMP}/ossutil" cp --force "${ARCHIVE_PATH}" "${destination}"
+          # 每个文件按原名上传到 <prefix>/<tag>/<文件名>。tag 目录隔离版本；
+          # 脚本从不删除 OSS 对象，改名重传会留下旧对象，需要时手动清。
+          manifest="${RUNNER_TEMP}/release-assets.json"
+          rows="${RUNNER_TEMP}/release-assets.tsv"
+          : > "${rows}"
+          while IFS= read -r -d '' path; do
+            name="$(basename "${path}")"
+            destination="oss://${OSS_BUCKET}/${object_dir}/${name}"
+            public_url="${OSS_BASE_URL%/}/${object_dir}/${name}"
+            "${RUNNER_TEMP}/ossutil" cp --force "${path}" "${destination}"
+            sha256="$(sha256sum "${path}" | cut -d' ' -f1)"
+            # 用 wc -c 而不是 stat：`stat -c` 是 GNU 语法，BSD/macOS 上直接报错。
+            # runner 虽然是 ubuntu，但这样这一步在本机也能原样跑一遍验证。
+            size="$(wc -c < "${path}" | tr -d ' ')"
+            printf '%s\t%s\t%s\t%s\n' "${name}" "${public_url}" "${sha256}" "${size}" >> "${rows}"
+          done < <(find "${FILES_DIR}" -maxdepth 1 -type f -print0 | sort -z)
 
-          echo "destination=${destination}" >> "${GITHUB_OUTPUT}"
-          echo "public_url=${public_url}" >> "${GITHUB_OUTPUT}"
+          # 清单走文件不走 GITHUB_OUTPUT：多行、可能很长。
+          python3 - "${rows}" "${manifest}" <<'PY'
+          import json, sys
+          rows = [line.rstrip("\n").split("\t") for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+          assets = [{"name": n, "url": u, "sha256": s, "size": int(z)} for n, u, s, z in rows]
+          with open(sys.argv[2], "w", encoding="utf-8") as fh:
+              json.dump(assets, fh, ensure_ascii=False, indent=2)
+          print(f"{len(assets)} 个文件已上传", *[a["url"] for a in assets], sep="\n  ")
+          PY
+          first_url="$(cut -f2 "${rows}" | head -1)"
+
+          echo "manifest_path=${manifest}" >> "${GITHUB_OUTPUT}"
+          echo "public_url=${first_url}" >> "${GITHUB_OUTPUT}"
 
           {
             echo "### Aliyun OSS upload complete"
             echo
             echo "- Release: \`${RELEASE_TAG}\`"
-            echo "- Object: \`${destination}\`"
-            echo "- CDN URL: ${public_url}"
+            echo "- Files:"
+            while IFS=$'\t' read -r name url _sha _size; do
+              echo "  - \`${name}\` → ${url}"
+            done < "${rows}"
           } >> "${GITHUB_STEP_SUMMARY}"
 
+      # 到这里制品已经在 CDN 上了。飞书这边配错只会让这一步红，不影响分发。
       - name: Sync release to Feishu
         env:
-          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
-          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
-          PUBLIC_URL: ${{ steps.upload.outputs.public_url }}
+          RELEASE_ASSETS_FILE: ${{ steps.upload.outputs.manifest_path }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          export ARCHIVE_SHA256="$(sha256sum "${ARCHIVE_PATH}" | cut -d' ' -f1)"
+
+          : "${FEISHU_APP_ID:?Missing GitHub Secret: FEISHU_APP_ID}"
+          : "${FEISHU_APP_SECRET:?Missing GitHub Secret: FEISHU_APP_SECRET}"
+          : "${FEISHU_CHAT_ID:?Missing GitHub Variable: FEISHU_CHAT_ID（一个或多个群 chat_id，逗号分隔）}"
+
+          if [[ ! -f .github/scripts/feishu_release.py ]]; then
+            echo "缺少 .github/scripts/feishu_release.py，用 feishu-automation 仓库的 tools/sync-workflows.sh 同步过来。" >&2
+            exit 1
+          fi
+
           python3 .github/scripts/feishu_release.py --from-event

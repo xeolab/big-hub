@@ -21,7 +21,16 @@
     # 本地回填：把某个已有 tag 补进飞书
     python3 feishu_release.py --repo xeolab/cinema-demo --tag v1.2.0
 
-环境变量见 README.md。
+    # 多个群里只有一个发失败了：只补发那个群，别让其他群再收一张
+    python3 feishu_release.py --repo xeolab/cinema-demo --tag v1.2.0 --only-chat oc_xxx
+
+资产清单：workflow 把每个上传到 OSS 的文件写成 JSON 数组
+[{"name","url","sha256","size"}]，路径放在 RELEASE_ASSETS_FILE（或内联在
+RELEASE_ASSETS_JSON）。没有清单时退回旧的 ARCHIVE_NAME / PUBLIC_URL /
+ARCHIVE_SHA256 三件套（单文件）。
+
+群目标：FEISHU_CHAT_ID 可以是多个 chat_id，逗号/分号/空白分隔。
+其余环境变量见 README.md。
 """
 
 from __future__ import annotations
@@ -53,6 +62,25 @@ COMMIT_SKIP = ("docs", "test", "ci", "release")
 
 class FeishuError(RuntimeError):
     """飞书接口返回了非 0 的业务码。"""
+
+    def __init__(self, message: str, code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# 拿 token 时最常见的两个码。光看 code=10014 不知道该改哪儿——写清楚该动哪个值。
+TOKEN_HINTS: dict[int, str] = {
+    10013: (
+        "app_id 不存在或不属于这个租户。检查 GitHub Secret FEISHU_APP_ID "
+        "是不是填成了别的应用 / 别的租户的。"
+    ),
+    10014: (
+        "app_secret 和 app_id 对不上。多半是应用后台轮换过 App Secret，"
+        "而这个仓库的 GitHub Secret FEISHU_APP_SECRET 还是旧值（Secret 是每个仓库"
+        "各自一份，不是组织级）——去开放平台「凭证与基础信息」复制当前值写进本机 .env，"
+        "再跑 tools/sync-github-secrets.sh 同步到全部仓库。"
+    ),
+}
 
 
 # --------------------------------------------------------------------------
@@ -93,7 +121,7 @@ def _request(
             if code != 0:
                 # 99991663 = tenant_access_token 失效；其余业务码直接失败。
                 raise FeishuError(
-                    f"{method} {url} -> code={code} msg={payload.get('msg')!r}"
+                    f"{method} {url} -> code={code} msg={payload.get('msg')!r}", code=code
                 )
             return payload
 
@@ -104,11 +132,23 @@ def _request(
 
 
 def tenant_token(app_id: str, app_secret: str) -> str:
-    payload = _request(
-        "POST",
-        f"{FEISHU_HOST}/open-apis/auth/v3/tenant_access_token/internal",
-        body={"app_id": app_id, "app_secret": app_secret},
-    )
+    try:
+        payload = _request(
+            "POST",
+            f"{FEISHU_HOST}/open-apis/auth/v3/tenant_access_token/internal",
+            body={"app_id": app_id, "app_secret": app_secret},
+        )
+    except FeishuError as exc:
+        hint = TOKEN_HINTS.get(exc.code or 0)
+        if hint:
+            # app_id 只回显前缀：GitHub 会把 Secret 全文打码成 ***，打全了反而看不见。
+            raise FeishuError(
+                f"{exc}\n  → {hint}\n"
+                f"  当前用的 app_id 前缀：{app_id[:8]}…（长度 {len(app_id)}），"
+                f"app_secret 长度 {len(app_secret)}",
+                code=exc.code,
+            ) from exc
+        raise
     token = payload.get("tenant_access_token")
     if not token:
         raise FeishuError(f"未拿到 tenant_access_token：{payload}")
@@ -294,11 +334,11 @@ def upsert_base_record(
 def send_card_as_bot(
     token: str, chat_id: str, card: dict[str, Any], *, dry_run: bool
 ) -> None:
-    """以应用身份把卡片发到群里。
+    """以应用身份把卡片发到一个群。
 
-    比群机器人 webhook 好在：消息来自应用本体（点头像能看到应用信息），
-    不需要额外维护一个 webhook secret，且机器人本来就要进群才能收 @ 消息。
-    代价是应用必须已被拉进该群，否则报 permission denied。
+    只走应用身份，不再有「群自定义机器人 webhook」回退：webhook 指向的是另一个
+    机器人，卡片内容又是这里拼的，两条路并存只会让人搞不清改哪边生效。
+    应用必须已被拉进该群，否则报 permission denied。
     """
     url = f"{FEISHU_HOST}/open-apis/im/v1/messages?receive_id_type=chat_id"
     body = {
@@ -308,26 +348,146 @@ def send_card_as_bot(
         "content": json.dumps(card, ensure_ascii=False),
     }
     if dry_run:
-        print(f"[dry-run] POST {url}\n{json.dumps(body, ensure_ascii=False)[:600]}")
+        print(f"[dry-run] POST {url} → {chat_id}\n{json.dumps(body, ensure_ascii=False)[:600]}")
         return
     _request("POST", url, token=token, body=body)
 
 
-def send_card(webhook: str, card: dict[str, Any], *, dry_run: bool) -> None:
-    payload = {"msg_type": "interactive", "card": card}
-    if dry_run:
-        print(f"[dry-run] POST {webhook.split('/hook/')[0]}/hook/***")
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        webhook, data=data, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    code = result.get("code", result.get("StatusCode", 0))
-    if code not in (0, None):
-        raise FeishuError(f"群机器人 webhook 失败：{result}")
+def split_chat_ids(raw: str) -> list[str]:
+    """FEISHU_CHAT_ID 支持多个目标：逗号 / 分号 / 空白 / 换行分隔，去重保序。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in re.split(r"[,;\s]+", raw or ""):
+        part = part.strip()
+        if part and part not in seen:
+            seen.add(part)
+            out.append(part)
+    return out
+
+
+def broadcast_card(
+    token: str, chat_ids: list[str], card: dict[str, Any], *, dry_run: bool
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """同一张卡逐个群发。返回 (成功的 chat_id, [(chat_id, 错误)])。
+
+    单个群失败**不中断**后面的——一个群没拉进机器人，不该让另外几个群收不到。
+    调用方看 failed 决定退出码；已成功的群不会在重跑时再收一张，靠 --only-chat。
+    """
+    ok: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for chat_id in chat_ids:
+        try:
+            send_card_as_bot(token, chat_id, card, dry_run=dry_run)
+            ok.append(chat_id)
+        except FeishuError as exc:
+            failed.append((chat_id, str(exc)))
+    return ok, failed
+
+
+# --------------------------------------------------------------------------
+# 资产清单
+# --------------------------------------------------------------------------
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def load_assets(env: dict[str, str] | os._Environ) -> list[dict[str, Any]]:
+    """本次发版上传到 CDN 的文件清单。
+
+    优先级：RELEASE_ASSETS_FILE（JSON 文件路径）> RELEASE_ASSETS_JSON（内联）
+    > 旧三件套 ARCHIVE_NAME / PUBLIC_URL / ARCHIVE_SHA256（单文件，本机回填还在用）。
+    每项 {"name","url","sha256","size"}；缺 name 或 url 的条目丢弃并打警告。
+    """
+    raw = ""
+    path = (env.get("RELEASE_ASSETS_FILE") or "").strip()
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = handle.read()
+        except OSError as exc:
+            sys.exit(f"读不到资产清单 RELEASE_ASSETS_FILE={path}：{exc}")
+    else:
+        raw = (env.get("RELEASE_ASSETS_JSON") or "").strip()
+
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            sys.exit(f"资产清单不是合法 JSON：{exc}")
+        if not isinstance(parsed, list):
+            sys.exit("资产清单必须是 JSON 数组")
+        assets: list[dict[str, Any]] = []
+        for item in parsed:
+            if not isinstance(item, dict) or not item.get("name") or not item.get("url"):
+                print(f"资产清单里有条目缺 name/url，已忽略：{str(item)[:120]}")
+                continue
+            assets.append({
+                "name": str(item["name"]),
+                "url": str(item["url"]),
+                "sha256": str(item.get("sha256") or ""),
+                "size": _int_or_none(item.get("size")),
+            })
+        return assets
+
+    name = (env.get("ARCHIVE_NAME") or "").strip()
+    url = (env.get("PUBLIC_URL") or "").strip()
+    if name and url:
+        return [{"name": name, "url": url,
+                 "sha256": (env.get("ARCHIVE_SHA256") or "").strip(), "size": None}]
+    return []
+
+
+def human_size(size: int | None) -> str:
+    if size is None:
+        return ""
+    value = float(size)
+    unit = "B"
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            break
+        value /= 1024
+    return f"{int(value)} B" if unit == "B" else f"{value:.1f} {unit}"
+
+
+def assets_markdown(assets: list[dict[str, Any]]) -> str:
+    """卡片里的文件列表：一行一个，带大小和 SHA256 前 8 位。"""
+    lines = []
+    for asset in assets:
+        extra = " · ".join(
+            x for x in (human_size(asset.get("size")), (asset.get("sha256") or "")[:8]) if x
+        )
+        lines.append(f"- [{asset['name']}]({asset['url']})" + (f" · {extra}" if extra else ""))
+    return "\n".join(lines)
+
+
+def assets_summary(assets: list[dict[str, Any]]) -> dict[str, Any]:
+    """写进发版记录表的逻辑列。
+
+    「下载地址」是超链接列，只能放一个——放第一个文件；全部文件放进「下载清单」
+    （多行文本）。表里没有「下载清单」列时 adapt_fields 会自动跳过，不用在这里判断。
+    """
+    if not assets:
+        return {}
+    out: dict[str, Any] = {
+        "文件名": "、".join(a["name"] for a in assets),
+        "下载地址": {"link": assets[0]["url"], "text": assets[0]["name"]},
+        "下载清单": "\n".join(
+            " | ".join(x for x in (a["name"], human_size(a.get("size")), a["url"], a.get("sha256") or "") if x)
+            for a in assets
+        ),
+    }
+    if len(assets) == 1:
+        sha = assets[0].get("sha256") or ""
+    else:
+        sha = "\n".join(f"{a['name']}: {a['sha256']}" for a in assets if a.get("sha256"))
+    if sha:
+        out["SHA256"] = sha
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -360,29 +520,51 @@ def build_card(ctx: dict[str, Any]) -> dict[str, Any]:
     if truncated:
         excerpt += "\n\n_（内容较长，已截断——点下方按钮看完整发布说明）_"
 
+    assets: list[dict[str, Any]] = ctx.get("assets") or []
+    if len(assets) == 1:
+        file_line = f"**文件**：`{assets[0]['name']}`\n"
+        download_line = f"**下载地址**：[{assets[0]['url']}]({assets[0]['url']})"
+    elif assets:
+        file_line = f"**文件**：{len(assets)} 个\n"
+        download_line = "**下载地址**：见下方文件列表"
+    else:
+        file_line = ""
+        download_line = "**下载地址**：本次未产出可下载文件"
+
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
             "content": (
                 f"**版本**：`{ctx['tag']}`\n"
                 f"**项目**：{ctx['project']}\n"
-                f"**文件**：`{ctx['archive_name']}`\n"
+                f"{file_line}"
                 f"**发布时间**：{ctx['published_at']}\n"
-                f"**下载地址**：[{ctx['download_url']}]({ctx['download_url']})"
+                f"{download_line}"
             ),
         },
+    ]
+    if len(assets) > 1:
+        # 多个文件（比如控制端 + 播放端两个 APK）逐个列出：飞书按钮没法一键下载多个，
+        # 所以多文件时正文给链接，不放下载按钮。
+        elements.append({"tag": "markdown", "content": "**本次文件**\n" + assets_markdown(assets)})
+    elements += [
         {"tag": "hr"},
         {"tag": "markdown", "content": f"**本版本变更**\n\n{excerpt}"},
     ]
 
-    actions = [
-        {
-            "tag": "button",
-            "type": "primary",
-            "text": {"tag": "plain_text", "content": "下载 Release ZIP"},
-            "url": ctx["download_url"],
-        }
-    ]
+    actions: list[dict[str, Any]] = []
+    if len(assets) == 1:
+        label = f"下载 {assets[0]['name']}"
+        if len(label) > 20:
+            label = label[:19] + "…"
+        actions.append(
+            {
+                "tag": "button",
+                "type": "primary",
+                "text": {"tag": "plain_text", "content": label},
+                "url": assets[0]["url"],
+            }
+        )
     if ctx.get("base_url"):
         actions.append(
             {
@@ -520,6 +702,8 @@ def main() -> int:
     parser.add_argument("--tag", help="tag 名，回填模式使用")
     parser.add_argument("--dry-run", action="store_true", help="只打印请求，不写任何东西")
     parser.add_argument("--skip-card", action="store_true", help="不发群卡片（回填历史时常用）")
+    parser.add_argument("--only-chat", default="",
+                        help="只把卡片发到这一个 chat_id（多群里某个发失败后补发用）")
     args = parser.parse_args()
 
     release, repo, tag, action = load_release(args)
@@ -543,9 +727,7 @@ def main() -> int:
         "notes": notes,
         "published_at": published_at,
         "prerelease": bool(release.get("prerelease")),
-        "archive_name": _env("ARCHIVE_NAME"),
-        "download_url": _env("PUBLIC_URL"),
-        "sha256": _env("ARCHIVE_SHA256"),
+        "assets": load_assets(os.environ),
         "release_url": release.get("html_url", ""),
         "base_url": _env("FEISHU_BASE_URL"),
         "card_limit": int(_env("FEISHU_CARD_LIMIT", "900")),
@@ -569,12 +751,7 @@ def main() -> int:
         published_ms = _epoch_ms(release.get("published_at") or "")
         if published_ms is not None:
             fields["发布时间"] = published_ms
-        if ctx["archive_name"]:
-            fields["文件名"] = ctx["archive_name"]
-        if ctx["sha256"]:
-            fields["SHA256"] = ctx["sha256"]
-        if ctx["download_url"]:
-            fields["下载地址"] = {"link": ctx["download_url"], "text": ctx["archive_name"] or "下载"}
+        fields.update(assets_summary(ctx["assets"]))
         if ctx["release_url"]:
             fields["GitHub Release"] = {"link": ctx["release_url"], "text": tag}
         key_field = _env("FEISHU_BASE_KEY_FIELD", "版本")
@@ -607,21 +784,27 @@ def main() -> int:
     else:
         print("未配置 FEISHU_BASE_APP_TOKEN / FEISHU_BASE_TABLE_ID，跳过发版记录表")
 
-    # 2) 群卡片。优先用应用身份直发（机器人已在群里时更好），否则退回 webhook。
-    chat_id = _env("FEISHU_CHAT_ID")
-    webhook = _env("FEISHU_WEBHOOK_URL")
+    # 2) 群卡片：应用身份直发，可以是多个群。
+    targets = [args.only_chat] if args.only_chat else split_chat_ids(_env("FEISHU_CHAT_ID"))
     if args.skip_card:
         print("已指定 --skip-card，跳过群卡片")
     elif not first_publish:
         pass  # 上面已说明原因
-    elif chat_id:
-        send_card_as_bot(token, chat_id, build_card(ctx), dry_run=args.dry_run)
-        print(f"群卡片已以应用身份发送到 {chat_id}")
-    elif webhook:
-        send_card(webhook, build_card(ctx), dry_run=args.dry_run)
-        print("群卡片已通过 webhook 发送")
+    elif not targets:
+        print("未配置 FEISHU_CHAT_ID，跳过群卡片")
     else:
-        print("未配置 FEISHU_CHAT_ID 或 FEISHU_WEBHOOK_URL，跳过群卡片")
+        card = build_card(ctx)
+        sent, failed = broadcast_card(token, targets, card, dry_run=args.dry_run)
+        for chat_id in sent:
+            print(f"群卡片已发送到 {chat_id}")
+        if failed:
+            for chat_id, err in failed:
+                print(f"::error::群卡片发送到 {chat_id} 失败：{err}")
+            print(
+                "发版记录表已经写好。**不要直接重跑 workflow**（已成功的群会再收一张），"
+                "补发单个群用：python3 feishu_release.py --repo <owner/name> --tag <tag> --only-chat <chat_id>"
+            )
+            return 1
 
     return 0
 
