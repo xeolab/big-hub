@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 """把一次 GitHub Release 同步到飞书：发版记录表 + 群卡片。
 
-设计约束（来自 pm/版本管理方案.md）：
+设计约束（来自飞书《XEO I.P. 软件产品管理》）：
 
-- 本脚本**只写发版记录表**（机器所有、只追加），**绝不写 §7.2 的版本台账**。
-  台账的唯一信息源是 release.yml，由人在 gate 通过后维护。两张表通过
-  「版本」字段关联，但永远不争夺所有权。
+- 本脚本**只写发版记录表**（机器所有、只追加），**绝不写版本台账**。
+  台账由人在双方 gate 通过后维护。两张表通过「版本」字段关联，但永远不争夺所有权。
 - 因此本脚本没有任何删除操作，重复执行同一个 tag 只会更新同一行（幂等）。
 
 依赖：仅标准库。GitHub Actions runner 自带 Python 3。
@@ -49,14 +48,14 @@ from typing import Any
 
 FEISHU_HOST = os.environ.get("FEISHU_HOST", "https://open.feishu.cn")
 
-# 约定式提交前缀 → changelog 分组。对齐 pm/版本管理方案.md §8.3 的五类。
+# 约定式提交前缀 → changelog 分组。新增/变更/修复/已知问题/移除五类。
 COMMIT_GROUPS: list[tuple[str, tuple[str, ...]]] = [
     ("新增", ("feat", "feature")),
     ("修复", ("fix", "bugfix", "hotfix")),
     ("变更", ("change", "refactor", "perf", "style", "build", "chore")),
     ("移除", ("remove", "revert", "deprecate")),
 ]
-# 不进 changelog 的类型：对使用者无可感知变化（§8.2）
+# 不进 changelog 的类型：对使用者无可感知变化
 COMMIT_SKIP = ("docs", "test", "ci", "release")
 
 
@@ -247,19 +246,64 @@ def build_notes(release: dict[str, Any], tag: str) -> str:
 # --------------------------------------------------------------------------
 
 
-def table_field_names(token: str, app_token: str, table_id: str) -> set[str]:
-    """读表里实际存在的字段名。用来适配人工改过的表结构。"""
+def table_fields(token: str, app_token: str, table_id: str) -> list[dict[str, Any]]:
+    """读表里实际存在的列（名字、类型、是否主列）。用来适配人工改过的表结构。"""
     payload = _request(
         "GET",
         f"{FEISHU_HOST}/open-apis/bitable/v1/apps/{app_token}"
         f"/tables/{table_id}/fields?page_size=100",
         token=token,
     )
-    return {
-        f.get("field_name")
-        for f in (payload.get("data") or {}).get("items") or []
-        if f.get("field_name")
-    }
+    return [f for f in (payload.get("data") or {}).get("items") or [] if f.get("field_name")]
+
+
+def primary_text_column(columns: list[dict[str, Any]]) -> str | None:
+    """主列（表最左那列）的名字；只有它是文本列时才返回——公式、自动编号等写不进去。"""
+    for col in columns:
+        if col.get("is_primary"):
+            return col["field_name"] if col.get("type") == 1 else None
+    return None
+
+
+_VERSION = re.compile(r"v?(\d+(?:\.\d+)+\S*)$", re.IGNORECASE)
+
+
+def app_name(project: str, repo: str) -> str:
+    """应用名：项目名去掉空格和符号（X-TMS→XTMS、Cinema Demo→CinemaDemo）；
+    项目名不是英文时退回仓库名转驼峰，去掉通用的 xeo / big 前缀（xeo-big-movie-box→MovieBox）。"""
+    if project.isascii():
+        compact = re.sub(r"[^A-Za-z0-9]", "", project)
+        if compact:
+            return compact
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", repo.split("/")[-1]) if p]
+    while len(parts) > 1 and parts[0].lower() in ("xeo", "big"):
+        parts.pop(0)
+    return "".join(p[:1].upper() + p[1:] for p in parts)
+
+
+def display_name(project: str, repo: str, tag: str, assets: list[dict[str, Any]]) -> str:
+    """发版记录表主列的名字，形如 AppName-Branch_v1.2.3，用来一眼区分各行。
+
+    分支取 tag 里版本号前面的前缀（alpha-v1.2.9.3 → Alpha）；tag 没带前缀时，
+    看文件名里紧挨版本号前面的那个词（XEOIMAXTheatre_Alpha_v1.2.15.5 → Alpha），
+    那个词只是应用名或仓库名的一部分（auto-box-v1.0.zip 的 box）就不算。都没有就不写分支。
+    """
+    app = app_name(project, repo)
+    match = _VERSION.search(tag)
+    if not match:
+        return f"{app}_{tag}"
+    version = "v" + match.group(1)
+    branch = tag[: match.start()].strip("-_ ")
+    if not branch:
+        own = (app + repo).lower()
+        pattern = re.compile(r"([A-Za-z]+)[-_ ]v?" + re.escape(match.group(1)), re.IGNORECASE)
+        for asset in assets:
+            hit = pattern.search(asset.get("name") or "")
+            if hit and hit.group(1).lower() not in own:
+                branch = hit.group(1)
+                break
+    branch = "".join(p[:1].upper() + p[1:] for p in re.split(r"[^A-Za-z0-9]+", branch) if p)
+    return f"{app}-{branch}_{version}" if branch else f"{app}_{version}"
 
 
 def adapt_fields(
@@ -293,11 +337,13 @@ def upsert_base_record(
     fields: dict[str, Any],
     *,
     dry_run: bool,
+    scope_field: str | None = None,
 ) -> str | None:
-    """按 key_field 幂等 upsert 一行。返回 record_id。
+    """按 key_field（再加上 scope_field，通常是「项目」）幂等 upsert 一行。返回 record_id。
 
     先 search 再决定 create/update，而不是无脑 create——workflow 重跑、
     release 被 edit 后重新触发都会走到这里，不能产生重复行。
+    只按 tag 找会让两个项目的同名 tag（都叫 v1.0.0）互相覆盖，所以有项目列时一并匹配。
     """
     base = f"{FEISHU_HOST}/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records"
     key_value = fields[key_field]
@@ -316,7 +362,8 @@ def upsert_base_record(
                 "conjunction": "and",
                 "conditions": [
                     {"field_name": key_field, "operator": "is", "value": [key_value]}
-                ],
+                ] + ([{"field_name": scope_field, "operator": "is", "value": [fields[scope_field]]}]
+                     if scope_field and fields.get(scope_field) else []),
             }
         },
     )
@@ -744,7 +791,6 @@ def main() -> int:
         fields: dict[str, Any] = {
             "版本": tag,
             "项目": project,
-            "仓库": repo,
             "发布说明": notes,
             "预发布": bool(release.get("prerelease")),
         }
@@ -761,9 +807,10 @@ def main() -> int:
             sys.exit(f"FEISHU_BASE_FIELD_MAP 不是合法 JSON：{exc}")
 
         if args.dry_run:
-            actual = set(fields) | {rename.get(key_field, key_field)}
+            columns = [{"field_name": n} for n in set(fields) | {rename.get(key_field, key_field)}]
         else:
-            actual = table_field_names(token, base_app, base_table)
+            columns = table_fields(token, base_app, base_table)
+        actual = {c["field_name"] for c in columns}
 
         key_column = rename.get(key_field, key_field)
         if key_column not in actual:
@@ -776,9 +823,15 @@ def main() -> int:
         fields, skipped = adapt_fields(fields, actual, rename)
         if skipped:
             print(f"表里没有这些列，已跳过（不影响写入）：{'、'.join(skipped)}")
+        # 主列是人建表时的默认列（叫「文本」还是别的都行），没被上面的逻辑列占用就填一个可读的名字
+        primary = primary_text_column(columns)
+        if primary and primary not in fields:
+            fields[primary] = display_name(project, repo, tag, ctx["assets"])
 
+        scope = rename.get("项目", "项目")
         record_id = upsert_base_record(
-            token, base_app, base_table, key_column, fields, dry_run=args.dry_run
+            token, base_app, base_table, key_column, fields, dry_run=args.dry_run,
+            scope_field=scope if scope in fields else None,
         )
         print(f"发版记录表已更新：{record_id or '(dry-run)'}")
     else:
