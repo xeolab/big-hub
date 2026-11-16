@@ -1,0 +1,2 @@
+# 本地并行开发的 worktree（机器中间物，不入库）
+.claude/worktrees/
