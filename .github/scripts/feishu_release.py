@@ -630,21 +630,20 @@ def build_card(ctx: dict[str, Any]) -> dict[str, Any]:
         }
     )
 
-    elements.extend(
-        [
-            {"tag": "hr"},
+    elements.append({"tag": "hr"})
+    if ctx.get("prerelease"):
+        elements.append(
             {
                 "tag": "note",
                 "elements": [
                     {
                         "tag": "plain_text",
-                        "content": "该版本尚未经过 XEO 验收 gate，请勿直接外发给客户。",
+                        "content": "该版本尚未经过 XEO 验收，请勿直接外发给客户。",
                     }
                 ],
-            },
-            {"tag": "action", "actions": actions},
-        ]
-    )
+            }
+        )
+    elements.append({"tag": "action", "actions": actions})
 
     return {
         "config": {"wide_screen_mode": True},
